@@ -32,8 +32,8 @@ jobs:
           cache: pnpm
           cache-dependency-path: pnpm-lock.yaml
       - run: make deps-frontend deps-backend
-      # xgo build
-      - run: make release
+      # xgo build (linux amd64 only)
+      - run: make frontend generate release-linux release-copy release-compress vendor release-sources release-check LINUX_ARCHS=linux/amd64
         env:
           TAGS: bindata sqlite sqlite_unlock_notify
       - name: import gpg key
