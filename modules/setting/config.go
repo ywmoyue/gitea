@@ -60,6 +60,7 @@ type ConfigStruct struct {
 	Picture    *PictureStruct
 	Repository *RepositoryStruct
 	Instance   *InstanceStruct
+	Packages   *PackagesStruct
 }
 
 var (
@@ -81,6 +82,9 @@ func initDefaultConfig() {
 		Instance: &InstanceStruct{
 			WebBanner:       config.NewOption[WebBannerType]("instance.web_banner"),
 			MaintenanceMode: config.NewOption[MaintenanceModeType]("instance.maintenance_mode"),
+		},
+		Packages: &PackagesStruct{
+			MavenProxy: config.NewOption[MavenProxyType]("packages.maven_proxy"),
 		},
 	}
 }
