@@ -1,0 +1,23 @@
+<h4 class="ui top attached header">{{ctx.Locale.Tr "admin.config.packages_maven_proxy"}}</h4>
+<div class="ui attached segment">
+	<form class="ui form ignore-dirty system-config-form" method="post" action="{{AppSubUrl}}/-/admin/config">
+		{{$cfgOpt := $.SystemConfig.Packages.MavenProxy}}
+		{{$cfgKey := $cfgOpt.DynKey}}
+		{{$mavenProxy := $cfgOpt.Value ctx}}
+		<input type="hidden" data-config-dyn-key="{{$cfgKey}}" data-config-value-json="{{JsonUtils.EncodeToString $mavenProxy}}">
+		<div class="field">
+			<div class="ui checkbox tw-mb-2">
+				<input type="checkbox" name="{{$cfgKey}}.Enabled" value="true" {{if $mavenProxy.Enabled}}checked{{end}} data-config-value-type="boolean">
+				<label>{{ctx.Locale.Tr "admin.config.packages_maven_proxy_enabled"}}</label>
+			</div>
+		</div>
+		<div class="field">
+			<label>{{ctx.Locale.Tr "admin.config.packages_maven_proxy_upstream_url"}}</label>
+			<input name="{{$cfgKey}}.UpstreamURL" value="{{$mavenProxy.UpstreamURL}}" placeholder="https://repo.maven.apache.org/maven2" maxlength="500" dir="auto">
+			<div class="help">{{ctx.Locale.Tr "admin.config.packages_maven_proxy_upstream_url_help"}}</div>
+		</div>
+		<div class="field">
+			<button class="ui primary button">{{ctx.Locale.Tr "save"}}</button>
+		</div>
+	</form>
+</div>

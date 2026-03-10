@@ -18,12 +18,15 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	packages_model "code.gitea.io/gitea/models/packages"
 	"code.gitea.io/gitea/modules/globallock"
 	"code.gitea.io/gitea/modules/json"
+	"code.gitea.io/gitea/modules/log"
 	packages_module "code.gitea.io/gitea/modules/packages"
 	maven_module "code.gitea.io/gitea/modules/packages/maven"
+	"code.gitea.io/gitea/modules/setting"
 	"code.gitea.io/gitea/modules/util"
 	"code.gitea.io/gitea/routers/api/packages/helper"
 	"code.gitea.io/gitea/services/context"
@@ -45,6 +48,11 @@ const (
 var (
 	errInvalidParameters = errors.New("request parameters are invalid")
 	illegalCharacters    = regexp.MustCompile(`[\\/:"<>|?*]`)
+
+	// upstreamHTTPClient is used for all upstream proxy requests with a reasonable timeout
+	upstreamHTTPClient = &http.Client{
+		Timeout: 60 * time.Second,
+	}
 )
 
 func apiError(ctx *context.Context, status int, obj any) {
@@ -93,6 +101,10 @@ func serveMavenMetadata(ctx *context.Context, params parameters) {
 	pvs = append(pvsLegacy, pvs...)
 
 	if len(pvs) == 0 {
+		// Try upstream proxy if enabled
+		if tryServeFromUpstream(ctx, params) {
+			return
+		}
 		apiError(ctx, http.StatusNotFound, packages_model.ErrPackageNotExist)
 		return
 	}
@@ -154,6 +166,10 @@ func servePackageFile(ctx *context.Context, params parameters, serveContent bool
 	}
 	if err != nil {
 		if errors.Is(err, packages_model.ErrPackageNotExist) {
+			// Try upstream proxy if enabled
+			if tryFetchAndCacheFromUpstream(ctx, params, serveContent) {
+				return
+			}
 			apiError(ctx, http.StatusNotFound, err)
 		} else {
 			apiError(ctx, http.StatusInternalServerError, err)
@@ -225,6 +241,235 @@ func servePackageFile(ctx *context.Context, params parameters, serveContent bool
 
 	opts.Filename = pf.Name
 
+	helper.ServePackageFile(ctx, s, u, pf, opts)
+}
+
+// buildUpstreamURL constructs the upstream URL for the given request path
+func buildUpstreamURL(upstreamBase, requestPath string) string {
+	upstreamBase = strings.TrimRight(upstreamBase, "/")
+	if !strings.HasPrefix(requestPath, "/") {
+		requestPath = "/" + requestPath
+	}
+	return upstreamBase + requestPath
+}
+
+// tryServeFromUpstream attempts to serve a metadata file from the upstream Maven repository.
+// It returns true if the response was handled (either served or error written), false if upstream is disabled/unavailable.
+func tryServeFromUpstream(ctx *context.Context, params parameters) bool {
+	mavenProxy := setting.Config().Packages.MavenProxy.Value(ctx)
+	if !mavenProxy.Enabled || mavenProxy.UpstreamURL == "" {
+		return false
+	}
+
+	// Build the upstream path from the request
+	reqPath := ctx.PathParam("*")
+	if reqPath == "" {
+		return false
+	}
+	upstreamURL := buildUpstreamURL(mavenProxy.UpstreamURL, reqPath)
+
+	resp, err := upstreamHTTPClient.Get(upstreamURL) //nolint:gosec
+	if err != nil {
+		log.Warn("Maven upstream proxy: failed to fetch %s: %v", upstreamURL, err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Debug("Maven upstream proxy: upstream returned %d for %s", resp.StatusCode, upstreamURL)
+		return false
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Warn("Maven upstream proxy: failed to read response from %s: %v", upstreamURL, err)
+		return false
+	}
+
+	ext := strings.ToLower(path.Ext(params.Filename))
+	if isChecksumExtension(ext) {
+		ctx.PlainText(http.StatusOK, strings.TrimSpace(string(body)))
+		return true
+	}
+
+	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
+		ctx.Resp.Header().Set("Content-Type", contentType)
+	} else {
+		ctx.Resp.Header().Set("Content-Type", contentTypeXML)
+	}
+	ctx.Resp.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	ctx.Resp.WriteHeader(http.StatusOK)
+	_, _ = ctx.Resp.Write(body)
+	return true
+}
+
+// tryFetchAndCacheFromUpstream attempts to fetch a package file from the upstream Maven repository,
+// caches it locally, and serves it. Returns true if the response was handled.
+func tryFetchAndCacheFromUpstream(ctx *context.Context, params parameters, serveContent bool) bool {
+	mavenProxy := setting.Config().Packages.MavenProxy.Value(ctx)
+	if !mavenProxy.Enabled || mavenProxy.UpstreamURL == "" {
+		return false
+	}
+
+	reqPath := ctx.PathParam("*")
+	if reqPath == "" {
+		return false
+	}
+
+	ext := strings.ToLower(path.Ext(params.Filename))
+
+	// For checksum files, derive the base file path and serve the checksum from upstream directly
+	if isChecksumExtension(ext) {
+		upstreamURL := buildUpstreamURL(mavenProxy.UpstreamURL, reqPath)
+		resp, err := upstreamHTTPClient.Get(upstreamURL) //nolint:gosec
+		if err != nil {
+			log.Warn("Maven upstream proxy: failed to fetch checksum %s: %v", upstreamURL, err)
+			return false
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			return false
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return false
+		}
+		ctx.PlainText(http.StatusOK, strings.TrimSpace(string(body)))
+		return true
+	}
+
+	packageName := params.toInternalPackageName()
+
+	// Use a lock to prevent concurrent fetches of the same package
+	releaser, err := globallock.Lock(ctx, mavenPkgNameKey(packageName))
+	if err != nil {
+		log.Error("Maven upstream proxy: failed to acquire lock for %s, cannot fetch from upstream: %v", packageName, err)
+		return false
+	}
+	defer releaser()
+
+	// Check again after acquiring lock in case another goroutine already cached it
+	pv, err := packages_model.GetVersionByNameAndVersion(ctx, ctx.Package.Owner.ID, packages_model.TypeMaven, packageName, params.Version)
+	if err == nil {
+		// Package was cached by another request; fall through to serve it
+		filename := params.Filename
+		if isChecksumExtension(ext) {
+			filename = filename[:len(filename)-len(ext)]
+		}
+		pf, err := packages_model.GetFileForVersionByName(ctx, pv.ID, filename, packages_model.EmptyFileKey)
+		if err == nil {
+			pb, err := packages_model.GetBlobByID(ctx, pf.BlobID)
+			if err == nil {
+				serveLocalFile(ctx, pf, pb, ext, serveContent)
+				return true
+			}
+		}
+	}
+
+	// Fetch the file from upstream (without checksum extension)
+	baseFilename := params.Filename
+	baseFilePath := reqPath
+	upstreamURL := buildUpstreamURL(mavenProxy.UpstreamURL, baseFilePath)
+
+	resp, err := upstreamHTTPClient.Get(upstreamURL) //nolint:gosec
+	if err != nil {
+		log.Warn("Maven upstream proxy: failed to fetch %s: %v", upstreamURL, err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Debug("Maven upstream proxy: upstream returned %d for %s", resp.StatusCode, upstreamURL)
+		return false
+	}
+
+	buf, err := packages_module.CreateHashedBufferFromReader(resp.Body)
+	if err != nil {
+		log.Error("Maven upstream proxy: failed to create hashed buffer for %s: %v", upstreamURL, err)
+		return false
+	}
+	defer buf.Close()
+
+	pvci := &packages_service.PackageCreationInfo{
+		PackageInfo: packages_service.PackageInfo{
+			Owner:       ctx.Package.Owner,
+			PackageType: packages_model.TypeMaven,
+			Name:        packageName,
+			Version:     params.Version,
+		},
+		SemverCompatible: false,
+		Creator:          ctx.Package.Owner,
+	}
+
+	pfci := &packages_service.PackageFileCreationInfo{
+		PackageFileInfo: packages_service.PackageFileInfo{
+			Filename: baseFilename,
+		},
+		Creator:           ctx.Package.Owner,
+		Data:              buf,
+		IsLead:            false,
+		OverwriteExisting: false,
+	}
+
+	// Parse POM metadata if applicable
+	if path.Ext(baseFilename) == extensionPom {
+		pfci.IsLead = true
+		pvci.Metadata, err = maven_module.ParsePackageMetaData(buf)
+		if err != nil {
+			log.Warn("Maven upstream proxy: failed to parse POM metadata for %s: %v", upstreamURL, err)
+			// Continue without metadata
+			pvci.Metadata = nil
+		}
+		if _, err = buf.Seek(0, io.SeekStart); err != nil {
+			log.Error("Maven upstream proxy: failed to seek buffer for %s: %v", upstreamURL, err)
+			return false
+		}
+	}
+
+	_, pf, err := packages_service.CreatePackageOrAddFileToExisting(ctx, pvci, pfci)
+	if err != nil {
+		if err != packages_model.ErrDuplicatePackageFile {
+			log.Error("Maven upstream proxy: failed to cache package file %s: %v", upstreamURL, err)
+		}
+		return false
+	}
+
+	pb, err := packages_model.GetBlobByID(ctx, pf.BlobID)
+	if err != nil {
+		log.Error("Maven upstream proxy: failed to get blob for cached file %s: %v", upstreamURL, err)
+		return false
+	}
+
+	serveLocalFile(ctx, pf, pb, ext, serveContent)
+	return true
+}
+
+// serveLocalFile serves a package file from local storage
+func serveLocalFile(ctx *context.Context, pf *packages_model.PackageFile, pb *packages_model.PackageBlob, ext string, serveContent bool) {
+	opts := &context.ServeHeaderOptions{
+		ContentLength: &pb.Size,
+		LastModified:  pf.CreatedUnix.AsLocalTime(),
+	}
+	switch ext {
+	case extensionJar:
+		opts.ContentType = contentTypeJar
+	case extensionPom:
+		opts.ContentType = contentTypeXML
+	}
+
+	if !serveContent {
+		ctx.SetServeHeaders(opts)
+		ctx.Status(http.StatusOK)
+		return
+	}
+
+	s, u, _, err := packages_service.OpenBlobForDownload(ctx, pf, pb, ctx.Req.Method, nil)
+	if err != nil {
+		apiError(ctx, http.StatusInternalServerError, err)
+		return
+	}
+
+	opts.Filename = pf.Name
 	helper.ServePackageFile(ctx, s, u, pf, opts)
 }
 
